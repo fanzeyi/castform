@@ -3,8 +3,14 @@ extern crate actix_web;
 extern crate clap;
 extern crate failure;
 extern crate futures;
+extern crate http;
+extern crate hyper;
+extern crate hyper_tls;
 #[macro_use]
 extern crate serde_derive;
+extern crate serde_json;
+extern crate serde_urlencoded;
+extern crate tokio;
 extern crate toml;
 
 mod config;
@@ -70,7 +76,8 @@ fn main() -> Result<()> {
 
     let config = toml::from_str(&contents)?;
 
-    let ecobee = EcobeeActor::create(move |_| EcobeeActor::from_config(&config));
+    let ecobee =
+        EcobeeActor::from_config(&config).map(|actor| EcobeeActor::create(move |_| actor))?;
     let server = actix_web::server::new(move || server::build_server_factory(ecobee.clone()));
 
     let host = matches.value_of("host").unwrap();
