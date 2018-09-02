@@ -1,11 +1,13 @@
 extern crate actix;
 extern crate actix_web;
 extern crate clap;
+#[macro_use]
 extern crate failure;
 extern crate futures;
 extern crate http;
 extern crate hyper;
 extern crate hyper_tls;
+extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate serde_json;
