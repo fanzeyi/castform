@@ -1,4 +1,6 @@
 extern crate actix;
+#[macro_use]
+extern crate actix_derive;
 extern crate actix_web;
 extern crate clap;
 #[macro_use]
@@ -45,16 +47,14 @@ fn build_clap<'a, 'b>() -> App<'a, 'b> {
                 .value_name("CONFIG_FILE")
                 .default_value("config.toml")
                 .help("path to config file"),
-        )
-        .arg(
+        ).arg(
             Arg::with_name("host")
                 .short("H")
                 .long("host")
                 .value_name("HOST")
                 .default_value("127.0.0.1")
                 .help("HTTP host to listen to"),
-        )
-        .arg(
+        ).arg(
             Arg::with_name("port")
                 .short("p")
                 .long("port")

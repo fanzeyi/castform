@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::time::Duration;
 
-use actix::{Actor, Arbiter, Context, Handler};
+use actix::{Actor, Arbiter, AsyncContext, Context, Handler};
 use failure::{err_msg, Error};
 use futures::{Future, IntoFuture, Stream};
 use http::request::Builder;
@@ -30,7 +30,7 @@ where
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Clone, Debug)]
 struct AuthToken {
     access_token: String,
     refresh_token: String,
@@ -53,7 +53,7 @@ pub struct EcobeeActor {
     client: Client<HttpsConnector<HttpConnector>, Body>,
     username: String,
     password: String,
-    auth_token: Arc<Option<AuthToken>>,
+    auth_token: Option<AuthToken>,
 }
 
 impl EcobeeActor {
@@ -65,20 +65,20 @@ impl EcobeeActor {
         Ok(Client::builder().build::<_, Body>(https))
     }
 
+    fn build_url(path: &str) -> Result<Uri> {
+        format!("{}{}", Self::API_BASE, path)
+            .parse()
+            .map_err(Error::from)
+    }
+
     pub fn from_config(config: &Config) -> Result<Self> {
         Ok(Self {
             client_id: config.client_id.clone(),
             client: Self::build_client()?,
             username: config.username.clone(),
             password: config.password.clone(),
-            auth_token: Arc::new(None),
+            auth_token: None,
         })
-    }
-
-    fn build_url(path: &str) -> Result<Uri> {
-        format!("{}{}", Self::API_BASE, path)
-            .parse()
-            .map_err(Error::from)
     }
 
     fn send_request<R: DeserializeOwned + 'static>(
@@ -99,8 +99,7 @@ impl EcobeeActor {
                         Err(_) => e.into(),
                     }
                 })
-            })
-            .boxify()
+            }).boxify()
     }
 
     fn auth(
@@ -119,6 +118,7 @@ impl EcobeeActor {
         let query = serde_urlencoded::to_string(payload).expect("serialized query");
 
         if let Ok(url) = Self::build_url(&format!("/authorize?{}", query)) {
+            println!("POSTing to {}", url);
             let req = self.default_request(false).and_then(|mut req| {
                 req.method("POST")
                     .uri(url)
@@ -173,12 +173,12 @@ impl EcobeeActor {
             .header(
                 "User-Agent",
                 "Home Comfort/1.3.0 (iPhone; iOS 11.4; Scale/2.00)",
-            )
-            .header("X-ECOBEE-APP", "ecobee-ios");
+            ).header("X-ECOBEE-APP", "ecobee-ios");
 
         if auth {
-            let token = Arc::try_unwrap(self.auth_token.clone())
-                .map_err(|_| err_msg("unable to get auth token"))?
+            let token = self
+                .auth_token
+                .clone()
                 .ok_or_else(|| err_msg("auth token is not set yet"))?;
             let value = format!("Bearer {}", token.access_token);
 
@@ -192,20 +192,38 @@ impl EcobeeActor {
 impl Actor for EcobeeActor {
     type Context = Context<Self>;
 
-    fn started(&mut self, _ctx: &mut Self::Context) {
+    fn started(&mut self, ctx: &mut Self::Context) {
         let username = self.username.clone();
         let password = self.password.clone();
+        let addr = ctx.address();
         let auth = self
             .auth(username, password)
-            .map({
-                let mut auth = self.auth_token.clone();
-                move |token| *Arc::get_mut(&mut auth).unwrap() = Some(token)
-            })
-            .map_err(|err| {
+            .and_then(move |token| {
+                addr.try_send(SetAuthToken(token))
+                    .map_err(|_| err_msg("send error"))
+            }).map_err(|err| {
                 println!("{}", err);
             });
 
         Arbiter::spawn(auth);
+
+        ctx.run_interval(Duration::from_secs(20), |actor, context| {
+            if let Some(token) = actor.auth_token.clone() {
+                let addr = context.address();
+                println!("refreshing token...");
+                let refresh = actor
+                    .refresh_token(token.refresh_token)
+                    .map(move |token| {
+                        if let Err(_) = addr.try_send(SetAuthToken(token)) {
+                            eprintln!("send failed.");
+                        }
+                    }).map_err(|e| {
+                        eprintln!("error occurred when refreshing token: {:?}", e);
+                    });
+
+                Arbiter::spawn(refresh);
+            }
+        });
     }
 }
 
@@ -214,5 +232,17 @@ impl Handler<EcobeeQuery> for EcobeeActor {
 
     fn handle(&mut self, _query: EcobeeQuery, _ctx: &mut Self::Context) -> Self::Result {
         Ok(EcobeeResponse::Status(1))
+    }
+}
+
+#[derive(Message)]
+struct SetAuthToken(AuthToken);
+
+impl Handler<SetAuthToken> for EcobeeActor {
+    type Result = ();
+
+    fn handle(&mut self, request: SetAuthToken, _: &mut Self::Context) -> Self::Result {
+        println!("setting token to: {:?}", request.0);
+        self.auth_token = Some(request.0.clone());
     }
 }
