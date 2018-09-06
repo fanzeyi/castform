@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use actix::{Actor, Arbiter, AsyncContext, Context, Handler};
@@ -10,6 +11,7 @@ use hyper::{Body, Client, Uri};
 use hyper_tls::HttpsConnector;
 use serde::de::DeserializeOwned;
 use serde_json;
+use serde_json::Value;
 use serde_urlencoded;
 
 use config::Config;
@@ -42,6 +44,30 @@ struct ErrorMessage {
     error_description: String,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ThermostatRuntime {
+    #[serde(rename = "actualTemperature")]
+    temperature: usize,
+    #[serde(rename = "actualHumidity")]
+    humidity: usize,
+    desired_heat: usize,
+    desired_cool: usize,
+}
+
+#[derive(Deserialize, Debug)]
+struct Thermostat {
+    runtime: ThermostatRuntime,
+    #[serde(flatten)]
+    other: HashMap<String, Value>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ThermostatResponse {
+    #[serde(rename = "thermostatList")]
+    thermostats: Vec<Thermostat>,
+}
+
 #[derive(Debug, Fail)]
 enum ErrorKind {
     #[fail(display = "remote error: {:?}", _0)]
@@ -54,6 +80,7 @@ pub struct EcobeeActor {
     username: String,
     password: String,
     auth_token: Option<AuthToken>,
+    thermostats: Vec<Thermostat>,
 }
 
 impl EcobeeActor {
@@ -83,6 +110,7 @@ impl EcobeeActor {
             username: config.username.clone(),
             password: config.password.clone(),
             auth_token: None,
+            thermostats: Vec::new(),
         })
     }
 
@@ -108,7 +136,7 @@ impl EcobeeActor {
     }
 
     fn auth(
-        &mut self,
+        &self,
         username: String,
         password: String,
     ) -> impl Future<Item = AuthToken, Error = Error> {
@@ -137,7 +165,7 @@ impl EcobeeActor {
         }
     }
 
-    fn refresh_token(&mut self, refresh: String) -> impl Future<Item = AuthToken, Error = Error> {
+    fn refresh_token(&self, refresh: String) -> impl Future<Item = AuthToken, Error = Error> {
         let payload = [
             ("client_id", self.client_id.clone()),
             ("refresh_token", refresh),
@@ -147,6 +175,28 @@ impl EcobeeActor {
         let req = Self::build_url("/token", payload.to_vec()).and_then(|url| {
             self.default_request(false).and_then(|mut req| {
                 req.method("POST")
+                    .uri(url)
+                    .body(Body::empty())
+                    .map_err(|e| e.into())
+            })
+        });
+
+        match req {
+            Ok(req) => self.send_request(req),
+            Err(err) => Err(err_msg(format!("failed to build the request: {:?}", err)))
+                .into_future()
+                .boxify(),
+        }
+    }
+
+    fn get_thermostat(&self) -> impl Future<Item = ThermostatResponse, Error = Error> {
+        let payload = [
+            ("json", r#"{"selection":{"includeOemCfg":"true","includeAlerts":"true","includeVersion":"true","includeLocation":"true","selectionType":"registered","includeEvents":"true","includeHouseDetails":"true","includeRuntime":"true","includeNotificationSettings":"true","includeProgram":"true","includeWeather":"true","includePrivacy":"true","includeSecuritySettings":"true","includeSettings":"true","includeExtendedRuntime":"true","includeSensors":"true","includeTechnician":"true"}}"#.into())
+        ];
+
+        let req = Self::build_url("/1/thermostat", payload.to_vec()).and_then(|url| {
+            self.default_request(true).and_then(|mut req| {
+                req.method("GET")
                     .uri(url)
                     .body(Body::empty())
                     .map_err(|e| e.into())
@@ -202,7 +252,7 @@ impl Actor for EcobeeActor {
 
         Arbiter::spawn(auth);
 
-        ctx.run_interval(Duration::from_secs(20), |actor, context| {
+        ctx.run_interval(Duration::from_secs(60 * 60 * 24), |actor, context| {
             if let Some(token) = actor.auth_token.clone() {
                 let addr = context.address();
                 println!("refreshing token...");
@@ -219,6 +269,21 @@ impl Actor for EcobeeActor {
                 Arbiter::spawn(refresh);
             }
         });
+
+        ctx.run_interval(Duration::from_secs(60), |actor, context| {
+            let addr = context.address();
+            let fut = actor
+                .get_thermostat()
+                .map(move |thermostat| {
+                    if let Err(_) = addr.try_send(UpdateThermostat(thermostat)) {
+                        eprintln!("send failed.");
+                    }
+                }).map_err(|e| {
+                    eprintln!("error occurred when fetching thermostat: {:?}", e);
+                });
+
+            Arbiter::spawn(fut);
+        });
     }
 }
 
@@ -227,6 +292,17 @@ impl Handler<EcobeeQuery> for EcobeeActor {
 
     fn handle(&mut self, _query: EcobeeQuery, _ctx: &mut Self::Context) -> Self::Result {
         Ok(EcobeeResponse::Status(1))
+    }
+}
+
+#[derive(Message)]
+struct UpdateThermostat(ThermostatResponse);
+
+impl Handler<UpdateThermostat> for EcobeeActor {
+    type Result = ();
+
+    fn handle(&mut self, update: UpdateThermostat, _: &mut Self::Context) -> Self::Result {
+        self.thermostats = update.0.thermostats;
     }
 }
 
