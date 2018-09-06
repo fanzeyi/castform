@@ -65,10 +65,15 @@ impl EcobeeActor {
         Ok(Client::builder().build::<_, Body>(https))
     }
 
-    fn build_url(path: &str) -> Result<Uri> {
-        format!("{}{}", Self::API_BASE, path)
-            .parse()
-            .map_err(Error::from)
+    fn build_url(path: &str, payload: Vec<(&str, String)>) -> Result<Uri> {
+        let url = if payload.is_empty() {
+            format!("{}{}", Self::API_BASE, path)
+        } else {
+            let query: String = serde_urlencoded::to_string(&payload).map_err(Error::from)?;
+            format!("{}{}?{}", Self::API_BASE, path, query)
+        };
+
+        url.parse().map_err(From::from)
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
@@ -107,62 +112,52 @@ impl EcobeeActor {
         username: String,
         password: String,
     ) -> impl Future<Item = AuthToken, Error = Error> {
-        let payload = &[
+        let payload = [
             ("client_id", self.client_id.clone()),
             ("username", username),
             ("password", password),
             ("scope", "smartWrite".into()),
             ("response_type", "ecobeeAuthz".into()),
         ];
-        let body = serde_json::to_string(payload).expect("serialized json");
-        let query = serde_urlencoded::to_string(payload).expect("serialized query");
-
-        if let Ok(url) = Self::build_url(&format!("/authorize?{}", query)) {
-            println!("POSTing to {}", url);
-            let req = self.default_request(false).and_then(|mut req| {
+        let body = serde_json::to_string(&payload).expect("serialized json");
+        let req = Self::build_url("/authorize", payload.to_vec()).and_then(|url| {
+            self.default_request(false).and_then(|mut req| {
                 req.method("POST")
                     .uri(url)
-                    .body(body.to_string().into())
+                    .body(body.into())
                     .map_err(|e| e.into())
-            });
+            })
+        });
 
-            if let Ok(req) = req {
-                self.send_request(req)
-            } else {
-                Err(err_msg("failed to build request"))
-                    .into_future()
-                    .boxify()
-            }
-        } else {
-            Err(err_msg("failed to build url")).into_future().boxify()
+        match req {
+            Ok(req) => self.send_request(req),
+            Err(err) => Err(err_msg(format!("failed to build the request: {:?}", err)))
+                .into_future()
+                .boxify(),
         }
     }
 
     fn refresh_token(&mut self, refresh: String) -> impl Future<Item = AuthToken, Error = Error> {
-        let payload = &[
+        let payload = [
             ("client_id", self.client_id.clone()),
             ("refresh_token", refresh),
             ("grant_type", "refresh_token".into()),
         ];
-        let query = serde_urlencoded::to_string(payload).expect("serialize query");
 
-        if let Ok(url) = Self::build_url(&format!("/token?{}", query)) {
-            let req = self.default_request(true).and_then(|mut req| {
+        let req = Self::build_url("/token", payload.to_vec()).and_then(|url| {
+            self.default_request(false).and_then(|mut req| {
                 req.method("POST")
                     .uri(url)
                     .body(Body::empty())
                     .map_err(|e| e.into())
-            });
+            })
+        });
 
-            if let Ok(req) = req {
-                self.send_request(req)
-            } else {
-                Err(err_msg("failed to build request"))
-                    .into_future()
-                    .boxify()
-            }
-        } else {
-            Err(err_msg("failed to build url")).into_future().boxify()
+        match req {
+            Ok(req) => self.send_request(req),
+            Err(err) => Err(err_msg(format!("failed to build the request: {:?}", err)))
+                .into_future()
+                .boxify(),
         }
     }
 
