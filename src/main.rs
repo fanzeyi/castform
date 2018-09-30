@@ -12,6 +12,7 @@ extern crate hyper_tls;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
 extern crate serde_json;
 extern crate serde_urlencoded;
 extern crate tokio;
@@ -47,14 +48,16 @@ fn build_clap<'a, 'b>() -> App<'a, 'b> {
                 .value_name("CONFIG_FILE")
                 .default_value("config.toml")
                 .help("path to config file"),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("host")
                 .short("H")
                 .long("host")
                 .value_name("HOST")
                 .default_value("127.0.0.1")
                 .help("HTTP host to listen to"),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("port")
                 .short("p")
                 .long("port")

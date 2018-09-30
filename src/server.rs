@@ -1,17 +1,27 @@
 use actix::Addr;
 use actix_web::http::StatusCode;
 use actix_web::server::{HttpHandler, HttpHandlerTask};
-use actix_web::{http, middleware, App, Error, HttpRequest, HttpResponse, Json, State};
+use actix_web::{http, middleware, App, Error, Form, HttpResponse, Json, State};
 use failure::err_msg;
-use futures::{Future, IntoFuture};
+use futures::Future;
 
-use ecobee::EcobeeActor;
+use ecobee::{ChangeThermostat, EcobeeActor};
 use query::EcobeeQuery;
 use response::{EcobeeResponse, EcobeeStatus};
 
 #[derive(Clone)]
 struct HttpServerState {
     ecobee: Addr<EcobeeActor>,
+}
+
+#[derive(Deserialize)]
+struct TemperatureForm {
+    temperature: f32,
+}
+
+#[derive(Deserialize)]
+struct ModeForm {
+    state: u8,
 }
 
 fn status(state: State<HttpServerState>) -> impl Future<Item = Json<EcobeeStatus>, Error = Error> {
@@ -27,21 +37,45 @@ fn status(state: State<HttpServerState>) -> impl Future<Item = Json<EcobeeStatus
 }
 
 fn set_heating_cooling_state(
-    state: State<HttpServerState>,
+    (state, mode): (State<HttpServerState>, Form<ModeForm>),
 ) -> impl Future<Item = HttpResponse, Error = Error> {
-    Ok(HttpResponse::build(StatusCode::OK)
-        .content_type("text/html; charset=utf-8")
-        .body("hello"))
-    .into_future()
+    state
+        .ecobee
+        .send(ChangeThermostat::HvacMode(mode.state))
+        .map_err(|_| err_msg("mailbox error"))
+        .flatten()
+        .flatten()
+        .map(|_: ()| {
+            HttpResponse::build(StatusCode::OK)
+                .content_type("text/html; charset=utf-8")
+                .body("done")
+        })
+        .map_err(|e| {
+            eprintln!("error: {:?}", e);
+            e
+        })
+        .from_err()
 }
 
 fn set_target_temperature(
-    _: HttpRequest<HttpServerState>,
+    (state, form): (State<HttpServerState>, Form<TemperatureForm>),
 ) -> impl Future<Item = HttpResponse, Error = Error> {
-    Ok(HttpResponse::build(StatusCode::OK)
-        .content_type("text/html; charset=utf-8")
-        .body("hello"))
-    .into_future()
+    state
+        .ecobee
+        .send(ChangeThermostat::Temperature(form.temperature))
+        .map_err(|_| err_msg("mailbox error"))
+        .flatten()
+        .flatten()
+        .map(|_: ()| {
+            HttpResponse::build(StatusCode::OK)
+                .content_type("text/html; charset=utf-8")
+                .body("done")
+        })
+        .map_err(|e| {
+            eprintln!("error: {:?}", e);
+            e
+        })
+        .from_err()
 }
 
 pub fn build_server_factory(

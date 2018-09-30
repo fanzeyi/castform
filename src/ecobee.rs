@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use actix::{Actor, Arbiter, AsyncContext, Context, Handler};
+use actix::{Actor, Arbiter, AsyncContext, Context, Handler, Message};
 use failure::{err_msg, Error};
 use futures::{Future, IntoFuture, Stream};
 use http::request::Builder;
@@ -19,21 +19,25 @@ use query::EcobeeQuery;
 use response::{EcobeeResponse, EcobeeStatus};
 use Result;
 
-trait FutureExt<I, E> {
-    fn boxify(self) -> Box<dyn Future<Item = I, Error = E>>;
+trait FutureExt<I, E, F: Future<Item = I, Error = E>> {
+    fn boxify(self) -> Box<F>;
 }
 
-impl<I, E, F> FutureExt<I, E> for F
+impl<I, E, F> FutureExt<I, E, F> for F
 where
     F: Future<Item = I, Error = E> + 'static,
 {
-    fn boxify(self) -> Box<dyn Future<Item = I, Error = E>> {
+    fn boxify(self) -> Box<F> {
         Box::new(self)
     }
 }
 
 fn ftoc(f: f32) -> f32 {
-    (f - 32.0) / 1.8
+    ((f - 32.0) / 1.8 * 10.0).round() / 10.0
+}
+
+fn ctof(c: f32) -> f32 {
+    (c * 1.8) + 32.0
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -68,6 +72,7 @@ struct ThermostatSettings {
 
 #[derive(Deserialize, Debug)]
 struct Thermostat {
+    identifier: String,
     runtime: ThermostatRuntime,
     settings: ThermostatSettings,
     #[serde(flatten)]
@@ -78,6 +83,12 @@ struct Thermostat {
 struct ThermostatResponse {
     #[serde(rename = "thermostatList")]
     thermostats: Vec<Thermostat>,
+}
+
+#[derive(Deserialize, Debug)]
+struct UpdateResponse {
+    #[serde(flatten)]
+    other: HashMap<String, Value>,
 }
 
 #[derive(Debug, Fail)]
@@ -126,10 +137,10 @@ impl EcobeeActor {
         })
     }
 
-    fn send_request<R: DeserializeOwned + 'static>(
+    fn send_request<R: DeserializeOwned + Send + 'static>(
         &self,
         request: Request<Body>,
-    ) -> Box<Future<Item = R, Error = Error>> {
+    ) -> Box<Future<Item = R, Error = Error> + Send> {
         self.client
             .request(request)
             .and_then(|resp| resp.into_body().concat2())
@@ -224,6 +235,89 @@ impl EcobeeActor {
         }
     }
 
+    fn set_hvac_mode(
+        &self,
+        identifier: String,
+        mode: u8,
+    ) -> Box<Future<Item = UpdateResponse, Error = Error> + Send> {
+        let mode = match mode {
+            1 => "heat",
+            2 => "cool",
+            3 => "auto",
+            _ => "off",
+        };
+
+        let payload = json!({
+            "selection": {
+                "selectionType": "thermostats",
+                "selectionMatch": identifier,
+            },
+            "thermostat": [{
+                "settings": {
+                    "hvacMode": mode
+                }
+            }]
+        });
+
+        let req =
+            Self::build_url("/1/thermostat?format=json&format=json", Vec::new()).and_then(|url| {
+                self.default_request(true).and_then(|mut req| {
+                    req.method("POST")
+                        .uri(url)
+                        .body(payload.to_string().into())
+                        .map_err(|e| e.into())
+                })
+            });
+
+        match req {
+            Ok(req) => Box::new(self.send_request(req)),
+            Err(err) => Err(err_msg(format!("failed to build the request: {:?}", err)))
+                .into_future()
+                .boxify(),
+        }
+    }
+
+    fn set_temperature(
+        &self,
+        identifier: String,
+        heat: u16,
+        cool: u16, /* 770 */
+    ) -> impl Future<Item = UpdateResponse, Error = Error> {
+        let payload = json!({
+            "selection": {
+                "selectionType": "thermostats",
+                "selectionMatch": identifier,
+            },
+            "functions": [{
+                "type": "setHold",
+                "params": {
+                    "heatHoldTemp": heat,
+                    "coolHoldTemp": cool,
+                    "holdType": "indefinite"
+                }
+            }]
+        });
+
+        println!("payload: {:?}", payload);
+
+        let req =
+            Self::build_url("/1/thermostat?format=json&format=json", Vec::new()).and_then(|url| {
+                self.default_request(true).and_then(|mut req| {
+                    req.method("POST")
+                        .uri(url)
+                        .body(payload.to_string().into())
+                        .map_err(|e| e.into())
+                })
+            });
+
+        match req {
+            Ok(req) => self.send_request(req),
+            Err(err) => Err(err_msg(format!("failed to build the request: {:?}", err)))
+                .into_future()
+                .boxify(),
+        }
+    }
+
     fn default_request(&self, auth: bool) -> Result<Builder> {
         let mut builder = Request::builder();
 
@@ -286,7 +380,7 @@ impl Actor for EcobeeActor {
             }
         });
 
-        ctx.run_interval(Duration::from_secs(60), |actor, context| {
+        ctx.run_interval(Duration::from_secs(30), |actor, context| {
             let addr = context.address();
             let fut = actor
                 .get_thermostat()
@@ -328,7 +422,7 @@ impl Handler<EcobeeQuery> for EcobeeActor {
             Ok(EcobeeResponse::Status(EcobeeStatus::new(
                 mode,
                 ftoc(target),
-                ftoc(current),
+                ftoc(current).round(),
                 humidity,
                 target_humidity / 100.0,
             )))
@@ -358,5 +452,41 @@ impl Handler<SetAuthToken> for EcobeeActor {
     fn handle(&mut self, request: SetAuthToken, _: &mut Self::Context) -> Self::Result {
         println!("setting token to: {:?}", request.0);
         self.auth_token = Some(request.0.clone());
+    }
+}
+
+pub enum ChangeThermostat {
+    HvacMode(u8),
+    Temperature(f32),
+}
+
+impl Message for ChangeThermostat {
+    type Result = Result<Box<Future<Item = (), Error = Error> + Send + 'static>>;
+}
+
+impl Handler<ChangeThermostat> for EcobeeActor {
+    type Result = Result<Box<Future<Item = (), Error = Error> + Send + 'static>>;
+
+    fn handle(&mut self, request: ChangeThermostat, _: &mut Self::Context) -> Self::Result {
+        if let Some(thermostat) = self.thermostats.first() {
+            match request {
+                ChangeThermostat::HvacMode(mode) => Ok(self
+                    .set_hvac_mode(thermostat.identifier.clone(), mode)
+                    .map(|_| ())
+                    .boxify()),
+                ChangeThermostat::Temperature(temperature) => {
+                    let temperature = (ctof(temperature) * 10.0) as u16;
+                    let heat = temperature - 30;
+                    let cool = temperature + 30;
+
+                    Ok(self
+                        .set_temperature(thermostat.identifier.clone(), heat, cool)
+                        .map(|_| ())
+                        .boxify())
+                }
+            }
+        } else {
+            Err(err_msg("no thermostat available"))
+        }
     }
 }
