@@ -16,7 +16,7 @@ use serde_urlencoded;
 
 use config::Config;
 use query::EcobeeQuery;
-use response::EcobeeResponse;
+use response::{EcobeeResponse, EcobeeStatus};
 use Result;
 
 trait FutureExt<I, E> {
@@ -30,6 +30,10 @@ where
     fn boxify(self) -> Box<dyn Future<Item = I, Error = E>> {
         Box::new(self)
     }
+}
+
+fn ftoc(f: f32) -> f32 {
+    (f - 32.0) / 1.8
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -53,11 +57,19 @@ struct ThermostatRuntime {
     humidity: usize,
     desired_heat: usize,
     desired_cool: usize,
+    desired_humidity: usize,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ThermostatSettings {
+    hvac_mode: String,
 }
 
 #[derive(Deserialize, Debug)]
 struct Thermostat {
     runtime: ThermostatRuntime,
+    settings: ThermostatSettings,
     #[serde(flatten)]
     other: HashMap<String, Value>,
 }
@@ -132,7 +144,8 @@ impl EcobeeActor {
                         Err(_) => e.into(),
                     }
                 })
-            }).boxify()
+            })
+            .boxify()
     }
 
     fn auth(
@@ -218,7 +231,8 @@ impl EcobeeActor {
             .header(
                 "User-Agent",
                 "Home Comfort/1.3.0 (iPhone; iOS 11.4; Scale/2.00)",
-            ).header("X-ECOBEE-APP", "ecobee-ios");
+            )
+            .header("X-ECOBEE-APP", "ecobee-ios");
 
         if auth {
             let token = self
@@ -246,7 +260,8 @@ impl Actor for EcobeeActor {
             .and_then(move |token| {
                 addr.try_send(SetAuthToken(token))
                     .map_err(|_| err_msg("send error"))
-            }).map_err(|err| {
+            })
+            .map_err(|err| {
                 println!("{}", err);
             });
 
@@ -262,7 +277,8 @@ impl Actor for EcobeeActor {
                         if let Err(_) = addr.try_send(SetAuthToken(token)) {
                             eprintln!("send failed.");
                         }
-                    }).map_err(|e| {
+                    })
+                    .map_err(|e| {
                         eprintln!("error occurred when refreshing token: {:?}", e);
                     });
 
@@ -278,7 +294,8 @@ impl Actor for EcobeeActor {
                     if let Err(_) = addr.try_send(UpdateThermostat(thermostat)) {
                         eprintln!("send failed.");
                     }
-                }).map_err(|e| {
+                })
+                .map_err(|e| {
                     eprintln!("error occurred when fetching thermostat: {:?}", e);
                 });
 
@@ -291,7 +308,33 @@ impl Handler<EcobeeQuery> for EcobeeActor {
     type Result = Result<EcobeeResponse>;
 
     fn handle(&mut self, _query: EcobeeQuery, _ctx: &mut Self::Context) -> Self::Result {
-        Ok(EcobeeResponse::Status(1))
+        if let Some(thermostat) = self.thermostats.first() {
+            let mode: u8 = match &thermostat.settings.hvac_mode[..] {
+                "auto" => 3,
+                "cool" => 2,
+                "heat" => 1,
+                _ => 0,
+            };
+            let runtime = &thermostat.runtime;
+            let target: f32 = {
+                let heat = runtime.desired_heat as f32;
+                let cool = runtime.desired_cool as f32;
+                (heat + cool) / 20.0
+            };
+            let current: f32 = (runtime.temperature as f32) / 10.0;
+            let humidity: f32 = runtime.humidity as f32;
+            let target_humidity: f32 = runtime.desired_humidity as f32;
+
+            Ok(EcobeeResponse::Status(EcobeeStatus::new(
+                mode,
+                ftoc(target),
+                ftoc(current),
+                humidity,
+                target_humidity / 100.0,
+            )))
+        } else {
+            Err(err_msg("no thermostat available"))
+        }
     }
 }
 
