@@ -476,8 +476,8 @@ impl Handler<ChangeThermostat> for EcobeeActor {
                     .boxify()),
                 ChangeThermostat::Temperature(temperature) => {
                     let temperature = (ctof(temperature) * 10.0) as u16;
-                    let heat = temperature - 30;
-                    let cool = temperature + 30;
+                    let heat = temperature - 36;
+                    let cool = temperature + 36;
 
                     Ok(self
                         .set_temperature(thermostat.identifier.clone(), heat, cool)
